@@ -472,6 +472,10 @@ After installing, the following should all work without errors:
    page 2+ and verify the correct tab's settings are shown (not page 1's).
 8. With multi-page tabs, use keyboard `next_menu` / `prior_menu` at the
    first/last tab to wrap between pages.
+9. Install multiple mods that add subcategories to the same tab with
+   `optionalIndex` in non-sequential order (e.g. one mod at index 3, another
+   at 0 and 1, another at 2). All subcategories should appear in the correct
+   order regardless of which mod loads first.
 
 ---
 
@@ -526,3 +530,73 @@ stub so the 13 call sites in `add*`/`remove*` functions don't need to change.
 The real FPS improvement comes from `controllerToOption` in `getOptionTable`
 (O(1) lookup instead of O(N) scan per slider drag tick), not from caching
 `getAllOptions`.
+
+---
+
+## Review pass — additional fixes (round 3)
+
+### C. Subcategories (and options) could disappear when added out of index order
+
+**Bug (reported by a user on the upstream GitHub issue tracker):** when multiple
+mods add subcategories to the same tab using the `optionalIndex` parameter, and
+the mods load in an order that doesn't follow the index sequence, one
+subcategory can silently replace another, making it disappear from the UI.
+
+**Concrete scenario reported:**
+
+| Mod | `optionalIndex` |
+|-----|-----------------|
+| Borg Malorian | 3 |
+| Ricochet Redux | 0 and 1 |
+| Keep Drawing The Line | 2 |
+
+With the mods loading in that order, Keep Drawing The Line's subcategory (index
+2) was replaced by Borg Malorian's (index 3), so Keep Drawing The Line did not
+appear in the menu.
+
+**Root cause:** all `add*` functions used `table.insert(t, idx, v)` with the
+user-supplied `idx`. When `idx > #t + 1` (which happens whenever a mod adds at
+an index ahead of the current array length), `table.insert`'s behavior is
+implementation-defined — in LuaJIT (which CET uses) it silently sets `t[idx] = v`
+without shifting, creating holes. Subsequent `table.insert` calls then operate
+on a holey array where `#t` is undefined, causing elements to be overwritten or
+shifted to wrong positions.
+
+The same bug pattern existed in **all 8 `add*` functions** that accept
+`optionalIndex`: `addSubcategory`, `addSwitch`, `addRangeInt`, `addRangeFloat`,
+`addSelectorString`, `addButton`, `addKeyBinding`, `addCustom` — 15 call sites
+total.
+
+**Fix:** added a local `insertAt(t, idx, value)` helper:
+
+```lua
+local function insertAt(t, idx, value)
+    if t[idx] == nil then
+        t[idx] = value          -- slot is empty: assign directly, no shifting
+    else
+        table.insert(t, idx, value)  -- slot is occupied: shift and insert
+    end
+end
+```
+
+All 15 `table.insert(t, idx, v)` call sites in the `add*` functions now use
+`insertAt` instead. This makes the insertion order-independent: a mod adding at
+index 3 first, then another at index 1, then another at index 2, will produce
+a correctly-ordered `keys`/`options` array regardless of load order.
+
+**Trace through the reported scenario with the fix:**
+
+1. Borg (idx=3): `keys[3] == nil` -> `keys[3] = "borg"`. keys = `{nil, nil, "borg"}`.
+2. Ricochet1 (idx=0): `keys[0] == nil` -> `keys[0] = "ricochet1"`.
+3. Ricochet2 (idx=1): `keys[1] == nil` -> `keys[1] = "ricochet2"`.
+4. KeepDrawing (idx=2): `keys[2] == nil` -> `keys[2] = "keep"`.
+
+Final: `keys = {[0]="ricochet1", [1]="ricochet2", [2]="keep", [3]="borg"}`.
+All four subcategories present, in the right order. (Note: index 0 is outside
+Lua's conventional 1-based array part, but `pairs` iteration — which
+NativeSettings uses throughout — visits it correctly.)
+
+**Compatibility:** the fix is purely internal. The `insertAt` helper is a local
+function, not exposed on the `nativeSettings` table. No public API changed.
+The only observable behavior change is that out-of-order `optionalIndex` calls
+now produce the correct result instead of silently corrupting the array.

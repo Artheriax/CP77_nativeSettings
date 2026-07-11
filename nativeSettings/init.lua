@@ -44,6 +44,22 @@ local nativeSettings = {
     tabPageSetCache = nil,     -- per-page set lookup: tabPageSetCache[page][label] = true
 }
 
+-- Insert value at position idx in array t. If the target slot is empty (nil),
+-- assign directly instead of calling table.insert. This avoids the undefined
+-- table.insert behavior when idx > #t+1, which was causing subcategories and
+-- options to be replaced or disappear when mods added them out of index order
+-- with the optionalIndex parameter (e.g. one mod adds at index 3, another at
+-- index 1, another at index 2 — the order of mod loading shouldn't matter, but
+-- with plain table.insert it did, because shifting on a holey array is
+-- implementation-defined). Fix proposed by a user on the upstream issue tracker.
+local function insertAt(t, idx, value)
+    if t[idx] == nil then
+        t[idx] = value
+    else
+        table.insert(t, idx, value)
+    end
+end
+
 registerForEvent("onInit", function()
     -- General setup things:
     CName.add("hold_input")
@@ -729,7 +745,7 @@ function nativeSettings.addSubcategory(path, label, optionalIndex) -- Add a subc
     nativeSettings.data[tabPath].subcategories[subPath] = category
 
     local idx = optionalIndex or #nativeSettings.data[tabPath].keys + 1
-    table.insert(nativeSettings.data[tabPath].keys, idx, subPath)
+    insertAt(nativeSettings.data[tabPath].keys, idx, subPath)
     nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then -- Handle subcategory adding when the tab is open
@@ -854,11 +870,11 @@ function nativeSettings.addSwitch(path, label, desc, currentState, defaultState,
     if state == 0 then -- Add to subcategory
         switch.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, switch)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, switch)
     else -- Add to main tab
         switch.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, switch)
+        insertAt(nativeSettings.data[tabPath].options, idx, switch)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -885,11 +901,11 @@ function nativeSettings.addRangeInt(path, label, desc, min, max, step, currentVa
     if state == 0 then -- Add to subcategory
         range.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, range)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, range)
     else -- Add to main tab
         range.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, range)
+        insertAt(nativeSettings.data[tabPath].options, idx, range)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -916,11 +932,11 @@ function nativeSettings.addRangeFloat(path, label, desc, min, max, step, format,
     if state == 0 then -- Add to subcategory
         range.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, range)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, range)
     else -- Add to main tab
         range.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, range)
+        insertAt(nativeSettings.data[tabPath].options, idx, range)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -947,11 +963,11 @@ function nativeSettings.addSelectorString(path, label, desc, elements, selectedE
     if state == 0 then -- Add to subcategory
         selector.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, selector)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, selector)
     else -- Add to main tab
         selector.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, selector)
+        insertAt(nativeSettings.data[tabPath].options, idx, selector)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -978,11 +994,11 @@ function nativeSettings.addButton(path, label, desc, buttonText, textSize, callb
     if state == 0 then -- Add to subcategory
         button.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, button)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, button)
     else -- Add to main tab
         button.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, button)
+        insertAt(nativeSettings.data[tabPath].options, idx, button)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -1015,11 +1031,11 @@ function nativeSettings.addKeyBinding(path, label, desc, value, defaultValue, is
     if state == 0 then -- Add to subcategory
         keyBinding.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, keyBinding)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, keyBinding)
     else -- Add to main tab
         keyBinding.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, keyBinding)
+        insertAt(nativeSettings.data[tabPath].options, idx, keyBinding)
     end
     nativeSettings.invalidateOptionsCache()
 
@@ -1045,11 +1061,11 @@ function nativeSettings.addCustom(path, callback, optionalIndex) -- Call this to
     if state == 0 then -- Add to subcategory
         custom.path = subPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].subcategories[subPath].options + 1
-        table.insert(nativeSettings.data[tabPath].subcategories[subPath].options, idx, custom)
+        insertAt(nativeSettings.data[tabPath].subcategories[subPath].options, idx, custom)
     else -- Add to main tab
         custom.path = tabPath
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
-        table.insert(nativeSettings.data[tabPath].options, idx, custom)
+        insertAt(nativeSettings.data[tabPath].options, idx, custom)
     end
     nativeSettings.invalidateOptionsCache()
 
