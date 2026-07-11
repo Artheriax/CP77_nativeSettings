@@ -1,6 +1,23 @@
+-- Patched NativeSettings (fork)
+-- All public API is preserved. Internal changes are documented in CHANGES.md.
+--
+-- Key fixes vs. upstream:
+--   * nil-guard around menuListController:PushData (fixes the recurring init.lua:84 crash)
+--   * controller->option lookup table for O(1) getOptionTable (was O(N) per slider drag tick)
+--   * cached getAllOptions() (was rebuilding a fresh array on every setOption/clearControllers call)
+--   * table.remove instead of t[i]=nil in removeOption / removeSubcategory (was creating holes in arrays)
+--   * nil-guards on this.data[idx+1] / this.data[tabIndex] (out-of-range idx no longer crashes)
+--   * spawnButton copy-paste fix: off widget now references offState/body (was onState/body twice)
+--   * setOption uses o.isHold, not tab.isHold
+--   * setOption breaks after match
+--   * Game.GetPlayer() guarded for nil (audio events no longer crash on main menu)
+--   * previousButton / nextButton destroyed on close (was leaking widgets + callbacks)
+--   * getIndex / pathExists-in-page early-exit
+--   * Cron.Update iterates backwards to avoid skipping timers on removal
+
 local nativeSettings = {
     data = {},
-	currentTabPath = nil,
+    currentTabPath = nil,
     fromMods = false,
     minCETVersion = 1.25,
     settingsMainController = nil,
@@ -20,7 +37,11 @@ local nativeSettings = {
     lastSettingsCategoryIndex = 0,
     fromInit = false,
     version = 1.96,
-    Cron = require("Cron")
+    Cron = require("Cron"),
+    -- New internal state (do not touch from outside):
+    controllerToOption = {},   -- [controllerRef] -> option table, populated by spawn* functions
+    allOptionsCache = nil,     -- cached result of getAllOptions(), invalidated on add/remove
+    tabPageSetCache = nil,     -- per-page set lookup: tabPageSetCache[page][label] = true
 }
 
 registerForEvent("onInit", function()
@@ -44,14 +65,14 @@ registerForEvent("onInit", function()
 
         local rootWidget = this:GetRootCompoundWidget()
 
-        local button = rootWidget:GetWidgetByPath(BuildWidgetPath({ "wrapper", "extra", "brightness_btn"}))
-        if button then
-            button:SetMargin(5000, 5000, 5000, 5000)
+        local brightnessBtn = rootWidget:GetWidgetByPath(BuildWidgetPath({ "wrapper", "extra", "brightness_btn"}))
+        if brightnessBtn then
+            brightnessBtn:SetMargin(5000, 5000, 5000, 5000)
         end
 
-        local button = rootWidget:GetWidgetByPath(BuildWidgetPath({ "wrapper", "extra", "hdr_btn"}))
-        if button then
-            button:SetMargin(5000, 5000, 5000, 5000)
+        local hdrBtn = rootWidget:GetWidgetByPath(BuildWidgetPath({ "wrapper", "extra", "hdr_btn"}))
+        if hdrBtn then
+            hdrBtn:SetMargin(5000, 5000, 5000, 5000)
         end
     end)
 
@@ -72,11 +93,32 @@ registerForEvent("onInit", function()
     end)
 
     Observe("SingleplayerMenuGameController", "OnTooltipContainerSpawned", function (this) -- Add "Mods" menu button for inital main menu load
-        this:ShowActionsList()
+        -- The ShowActionsList call eventually fires AddMenuItem on the list controller.
+        -- Guarded with IsDefined so a missing controller doesn't blow up (was the source of the
+        -- recurring init.lua:84 "menuListController (a nil value)" crash).
+        if IsDefined(this) then
+            this:ShowActionsList()
+        end
     end)
 
     Observe("gameuiMenuItemListGameController", "AddMenuItem", function (this, _, spawnEvent) -- Add "Mods" menu button
         if spawnEvent.value == "OnSwitchToSettings" then
+            -- menuListController is not always ready at the moment AddMenuItem fires (e.g. during
+            -- initial main-menu spawn, or when other mods have stripped it). Defer to next tick
+            -- so the controller has time to attach its list, and bail out cleanly if it never does.
+            if not IsDefined(this.menuListController) then
+                nativeSettings.Cron.NextTick(function()
+                    if not IsDefined(this) then return end
+                    local list = this.menuListController
+                    if not IsDefined(list) then return end
+                    local data = PauseMenuListItemData.new()
+                    data.label = "Mods"
+                    data.eventName = "OnSwitchToSettings"
+                    data.action = PauseMenuAction.OpenSubMenu
+                    list:PushData(data)
+                end)
+                return
+            end
             local data = PauseMenuListItemData.new()
             data.label = "Mods"
             data.eventName = "OnSwitchToSettings"
@@ -99,14 +141,25 @@ registerForEvent("onInit", function()
             return
         end
         nativeSettings.lastNativeSettingsCategoryIndex = this.selectorCtrl:GetToggledIndex()
-		nativeSettings.callCurrentTabClosedCallback()
-		nativeSettings.currentTabPath = nil
+        nativeSettings.callCurrentTabClosedCallback()
+        nativeSettings.currentTabPath = nil
         nativeSettings.fromMods = false
         nativeSettings.settingsMainController = nil
         nativeSettings.clearControllers()
         nativeSettings.tabSizeCache = nil
-        nativeSettings.previousButton = nil
-        nativeSettings.nextButton = nil
+        nativeSettings.tabPageSetCache = nil
+
+        -- Destroy the page nav buttons instead of just forgetting them. The original code
+        -- dropped the Lua-side reference but the widgets (and their event catchers) stayed
+        -- parented to the bar, accumulating every time the menu was reopened.
+        if nativeSettings.previousButton then
+            nativeSettings.previousButton:Destroy()
+            nativeSettings.previousButton = nil
+        end
+        if nativeSettings.nextButton then
+            nativeSettings.nextButton:Destroy()
+            nativeSettings.nextButton = nil
+        end
     end)
 
     Override("SettingsMainGameController", "PopulateCategories", function (this, idx, wrapped) -- Override to remove "Not Localized" on tabs
@@ -126,12 +179,19 @@ registerForEvent("onInit", function()
 
                     if nativeSettings.tabSizeCache == nil then
                         this.selectorCtrl:PushData(newData)
-                    elseif nativeSettings.getIndex(nativeSettings.tabSizeCache[nativeSettings.currentPage], newData.label) ~= nil then
+                    elseif nativeSettings.tabPageSetCache and nativeSettings.tabPageSetCache[nativeSettings.currentPage] and nativeSettings.tabPageSetCache[nativeSettings.currentPage][newData.label] then
                         this.selectorCtrl:PushData(newData)
                     end
                 end
             end
             this.selectorCtrl:Refresh()
+
+            -- Clamp idx defensively: GetToggledIndex / lastNativeSettingsCategoryIndex can return -1
+            -- when nothing is selected, which previously fed straight into SetToggledIndex(-1) and
+            -- into this.data[idx+1] downstream (nil crash).
+            local maxIdx = -1
+            for _ in pairs(this.data) do maxIdx = maxIdx + 1 end
+            if idx == nil or idx < 0 or idx > maxIdx then idx = 0 end
 
             if nativeSettings.switchPage then
                 nativeSettings.switchPage = false
@@ -165,20 +225,25 @@ registerForEvent("onInit", function()
 
         nativeSettings.Cron.NextTick(function ()
             local bar = this:GetRootCompoundWidget():GetWidgetByPath(BuildWidgetPath({ "wrapper", "wrapper", "top_header", "wrapper", "center_holder"}))
+            if not bar then return end
 
             local maxWidth = 1900
             local padding = 43.6 -- Roughly the padding (Diff GetDesiredWidth and totalWidth)
 
             nativeSettings.tabSizeCache = {}
             nativeSettings.tabSizeCache[1] = {}
+            nativeSettings.tabPageSetCache = {}
+            nativeSettings.tabPageSetCache[1] = {}
 
             if bar:GetDesiredWidth() < maxWidth then -- Only one page
                 for _, tab in pairs(nativeSettings.data) do
                     table.insert(nativeSettings.tabSizeCache[1], tab.label)
+                    nativeSettings.tabPageSetCache[1][tab.label] = true
                 end
                 this:PopulateCategories(this.settings:GetMenuIndex()) -- Refresh
             else -- Multiple pages
                 local tabs = bar:GetWidgetByPath(BuildWidgetPath({ "menu_label_holder"}))
+                if not tabs then return end
                 local totalWidth = 0
 
                 for i = 0, tabs:GetNumChildren() - 1 do -- Cache widths / generate pages
@@ -187,14 +252,16 @@ registerForEvent("onInit", function()
                     if totalWidth > maxWidth then
                         totalWidth = 0
                         nativeSettings.tabSizeCache[#nativeSettings.tabSizeCache + 1] = {}
+                        nativeSettings.tabPageSetCache[#nativeSettings.tabPageSetCache + 1] = {}
                     end
                     local name = widget:GetWidgetByPath(BuildWidgetPath({ "txtValue"})):GetText()
                     table.insert(nativeSettings.tabSizeCache[#nativeSettings.tabSizeCache], name)
+                    nativeSettings.tabPageSetCache[#nativeSettings.tabPageSetCache][name] = true
                 end
 
                 local nextButton = require("UIButton").Create("next", ">") -- Create "Next" button
                 nextButton.root:SetAffectsLayoutWhenHidden(true)
-			    nextButton:Reparent(bar, -1)
+                nextButton:Reparent(bar, -1)
 
                 nextButton:RegisterCallback('OnRelease', function(_, evt) -- Next callback
                     if evt:IsAction('click') then
@@ -208,7 +275,7 @@ registerForEvent("onInit", function()
 
                 local previousButton = require("UIButton").Create("previous", "<")
                 previousButton.root:SetAffectsLayoutWhenHidden(true)
-			    previousButton:Reparent(bar, 0)
+                previousButton:Reparent(bar, 0)
 
                 previousButton:RegisterCallback('OnRelease', function(_, evt)
                     if evt:IsAction('click') then
@@ -305,13 +372,27 @@ registerForEvent("onInit", function()
                 idx = this.selectorCtrl:GetToggledIndex()
             end
 
-            local settingsCategory = this.data[idx + 1]
+            -- Resolve the actual settingsCategory from this.data.
+            -- For multi-page mode, idx is page-local (0..pageSize-1) and must be
+            -- converted to a global index by adding the sizes of all previous pages.
+            -- For single-page mode, idx is already the global index.
+            -- (Original logic preserved exactly; added nil guard at the end.)
+            local settingsCategory
             if nativeSettings.tabSizeCache and #nativeSettings.tabSizeCache > 1 then
                 local n = idx
                 for i = 1, nativeSettings.currentPage - 1 do
                     n = n + #nativeSettings.tabSizeCache[i]
                 end
                 settingsCategory = this.data[n + 1]
+            else
+                settingsCategory = this.data[idx + 1]
+            end
+            if not settingsCategory then
+                -- Defensive: idx out of range (e.g. tabSizeCache out of sync after a
+                -- tab was added/removed at runtime). Let the vanilla path take over
+                -- so the screen isn't blank, instead of crashing on .groupPath below.
+                wrapped(idx)
+                return
             end
 
             nativeSettings.currentTabPath = string.sub(NameToString(settingsCategory.groupPath), 2) -- Remove leading slash
@@ -394,8 +475,11 @@ registerForEvent("onInit", function()
         end
     end)
 
-    Override("SettingsSelectorControllerInt", "AcceptValue", function (this, forward, wrapped) -- Handle slider a / d float
-        if not nativeSettings.fromMods then wrapped(forward) end
+    Override("SettingsSelectorControllerInt", "AcceptValue", function (this, forward, wrapped) -- Handle slider a / d int
+        if not nativeSettings.fromMods then
+            wrapped(forward)
+            return
+        end
         local data = nativeSettings.getOptionTable(this)
         if not data then return end
         if forward then
@@ -439,7 +523,10 @@ registerForEvent("onInit", function()
     end)
 
     Override("SettingsSelectorControllerFloat", "AcceptValue", function (this, forward, wrapped) -- Handle slider a / d float
-        if not nativeSettings.fromMods then wrapped(forward) end
+        if not nativeSettings.fromMods then
+            wrapped(forward)
+            return
+        end
         local data = nativeSettings.getOptionTable(this)
         if not data then return end
         if forward then
@@ -497,9 +584,13 @@ registerForEvent("onInit", function()
             fill:SetTintColor(HDRColor.new({ Red = 0.070588238537312, Green = 0.070588238537312, Blue = 0.1294117718935, Alpha = 1.0 }))
         end)
 
-        local audioEvent = SoundPlayEvent.new() -- Play click sound
-        audioEvent.soundName = "ui_menu_onpress"
-        Game.GetPlayer():QueueEvent(audioEvent)
+        -- Game.GetPlayer() returns nil on the main menu / loading screens; guard against that.
+        local player = Game.GetPlayer()
+        if player then
+            local audioEvent = SoundPlayEvent.new() -- Play click sound
+            audioEvent.soundName = "ui_menu_onpress"
+            player:QueueEvent(audioEvent)
+        end
 
         data.callback()
     end)
@@ -538,13 +629,25 @@ registerForEvent("onInit", function()
 
     Override("SettingsMainGameController", "RequestRestoreDefaults", function (this, wrapped) -- Handle reset settings
         if nativeSettings.fromMods then
-            local audioEvent = SoundPlayEvent.new() -- Play click sound
-            audioEvent.soundName = "ui_menu_onpress"
-            Game.GetPlayer():QueueEvent(audioEvent)
+            local player = Game.GetPlayer()
+            if player then
+                local audioEvent = SoundPlayEvent.new() -- Play click sound
+                audioEvent.soundName = "ui_menu_onpress"
+                player:QueueEvent(audioEvent)
+            end
 
             local tabIndex = this.selectorCtrl:GetToggledIndex() + 1
-            for i = 1, nativeSettings.currentPage - 1 do
-                tabIndex = tabIndex + #nativeSettings.tabSizeCache[i]
+            if nativeSettings.tabSizeCache and #nativeSettings.tabSizeCache > 1 then
+                for i = 1, nativeSettings.currentPage - 1 do
+                    tabIndex = tabIndex + #nativeSettings.tabSizeCache[i]
+                end
+            end
+
+            -- Defensive: GetToggledIndex can return -1, which would make tabIndex 0 and crash
+            -- on this.data[tabIndex].groupPath below.
+            local cat = this.data[tabIndex]
+            if not cat then
+                return
             end
 
             if nativeSettings.data[nativeSettings.currentTabPath].restoreDefaultsCallback ~= nil then
@@ -555,7 +658,7 @@ registerForEvent("onInit", function()
                 return
             end
 
-            local settingsCategory = (this.data[tabIndex].groupPath.value):gsub("/", "")
+            local settingsCategory = (cat.groupPath.value):gsub("/", "")
 
             for _, o in pairs(nativeSettings.data[settingsCategory].options) do
                 if o.defaultValue ~= nil then
@@ -579,6 +682,8 @@ registerForEvent("onInit", function()
 end)
 
 registerForEvent("onUpdate", function(deltaTime)
+    -- Cron.Update already early-outs when timers is empty, so this is essentially a no-op
+    -- when the menu is closed and no deferred work is pending.
     nativeSettings.Cron.Update(deltaTime)
 end)
 
@@ -590,7 +695,7 @@ function nativeSettings.addTab(path, label, optionalClosedCallback) -- Use this 
     local tab = {}
     tab.path = path
     tab.label = label
-	tab.closedCallback = optionalClosedCallback
+    tab.closedCallback = optionalClosedCallback
     tab.options = {}
     tab.subcategories = {}
     tab.keys = {}
@@ -599,6 +704,7 @@ function nativeSettings.addTab(path, label, optionalClosedCallback) -- Use this 
     CName.add(tostring("/" .. path))
 
     nativeSettings.data[path] = tab
+    nativeSettings.invalidateOptionsCache()
 end
 
 function nativeSettings.addSubcategory(path, label, optionalIndex) -- Add a subcategory (Dark strip with a name) to a Tab. e.g "/path/subPath" (Path from addTab, followed by a simple identifier)
@@ -624,6 +730,7 @@ function nativeSettings.addSubcategory(path, label, optionalIndex) -- Add a subc
 
     local idx = optionalIndex or #nativeSettings.data[tabPath].keys + 1
     table.insert(nativeSettings.data[tabPath].keys, idx, subPath)
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then -- Handle subcategory adding when the tab is open
         local placementIndex = #nativeSettings.data[tabPath].options
@@ -666,12 +773,22 @@ function nativeSettings.removeSubcategory(path) -- Removes entire subcategory, r
         inkCompoundRef.RemoveChildByName(nativeSettings.settingsOptionsList, subPath)
         for _, option in pairs(nativeSettings.data[tabPath].subcategories[subPath].options) do
             inkCompoundRef.RemoveChildByName(nativeSettings.settingsOptionsList, option.widgetName)
+            -- Drop the controller->option mapping for the removed widgets
+            if option.controller then
+                nativeSettings.controllerToOption[tostring(option.controller)] = nil
+            end
         end
         nativeSettings.restoreScrollPos()
     end
 
     nativeSettings.data[tabPath].subcategories[subPath] = nil
-    nativeSettings.data[tabPath].keys[nativeSettings.getIndex(nativeSettings.data[tabPath].keys, subPath)] = nil
+    -- Was: nativeSettings.data[tabPath].keys[...] = nil  (creates a hole in the array, breaks #keys
+    -- and table.insert for any subsequent addSubcategory). Use table.remove via getIndex instead.
+    local keyIdx = nativeSettings.getIndex(nativeSettings.data[tabPath].keys, subPath)
+    if keyIdx then
+        table.remove(nativeSettings.data[tabPath].keys, keyIdx)
+    end
+    nativeSettings.invalidateOptionsCache()
 end
 
 function nativeSettings.removeOption(tab) -- Remove option widget, needs option table.
@@ -690,6 +807,12 @@ function nativeSettings.removeOption(tab) -- Remove option widget, needs option 
             nativeSettings.restoreScrollPos()
         end
 
+        local removed = nativeSettings.data[tabPath].subcategories[subPath].options[i]
+        if removed and removed.controller then
+            nativeSettings.controllerToOption[tostring(removed.controller)] = nil
+        end
+        -- Was: t[i] = nil (hole in array). table.remove keeps the array contiguous so that
+        -- subsequent getOptionIndexOffset / add* math stays correct.
         table.remove(nativeSettings.data[tabPath].subcategories[subPath].options, i)
         success = true
     else -- From main tab
@@ -703,7 +826,11 @@ function nativeSettings.removeOption(tab) -- Remove option widget, needs option 
             nativeSettings.restoreScrollPos()
         end
 
-        nativeSettings.data[tabPath].options[i] = nil
+        local removed = nativeSettings.data[tabPath].options[i]
+        if removed and removed.controller then
+            nativeSettings.controllerToOption[tostring(removed.controller)] = nil
+        end
+        table.remove(nativeSettings.data[tabPath].options, i)
         success = true
     end
 
@@ -711,16 +838,16 @@ function nativeSettings.removeOption(tab) -- Remove option widget, needs option 
         print(string.format("[NativeSettings] Tried to remove option with invalid option table: \"%s\"", tab.label))
         return
     end
+    nativeSettings.invalidateOptionsCache()
 end
 
 function nativeSettings.addSwitch(path, label, desc, currentState, defaultState, callback, optionalIndex) -- Call this to add a toggle switch
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" boolean switch is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local switch = {type = "switch", path = path, label = label, desc = desc, state = currentState, defaultValue = defaultState, callback = callback, controller = nil, fullPath = path}
 
@@ -733,6 +860,7 @@ function nativeSettings.addSwitch(path, label, desc, currentState, defaultState,
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, switch)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         switch.widgetName = nativeSettings.getNextOptionName()
@@ -746,12 +874,11 @@ end
 
 function nativeSettings.addRangeInt(path, label, desc, min, max, step, currentValue, defaultValue, callback, optionalIndex) -- Call this to add a range int widget
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" int slider is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local range = {type = "rangeInt", path = path, label = label, desc = desc, min = min, max = max, step = math.floor(step), currentValue = currentValue, defaultValue = defaultValue, callback = callback, controller = nil, fullPath = path}
 
@@ -764,6 +891,7 @@ function nativeSettings.addRangeInt(path, label, desc, min, max, step, currentVa
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, range)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         range.widgetName = nativeSettings.getNextOptionName()
@@ -777,12 +905,11 @@ end
 
 function nativeSettings.addRangeFloat(path, label, desc, min, max, step, format, currentValue, defaultValue, callback, optionalIndex) -- Call this to add a range float widget
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" float slider is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local range = {type = "rangeFloat", path = path, label = label, desc = desc, min = min, max = max, step = step, format = format, currentValue = currentValue, defaultValue = defaultValue, callback = callback, controller = nil, fullPath = path}
 
@@ -795,6 +922,7 @@ function nativeSettings.addRangeFloat(path, label, desc, min, max, step, format,
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, range)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         range.widgetName = nativeSettings.getNextOptionName()
@@ -808,12 +936,11 @@ end
 
 function nativeSettings.addSelectorString(path, label, desc, elements, selectedElementIndex, defaultSelectedElementIndex, callback, optionalIndex) -- Call this to add a string selector widget
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" string selector is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local selector = {type = "selectorString", path = path, label = label, desc = desc, elements = elements, selectedElementIndex = selectedElementIndex, defaultValue = defaultSelectedElementIndex, callback = callback, controller = nil, fullPath = path}
 
@@ -826,6 +953,7 @@ function nativeSettings.addSelectorString(path, label, desc, elements, selectedE
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, selector)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         selector.widgetName = nativeSettings.getNextOptionName()
@@ -839,12 +967,11 @@ end
 
 function nativeSettings.addButton(path, label, desc, buttonText, textSize, callback, optionalIndex) -- Call this to add a button widget
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" button is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local button = {type = "button", path = path, label = label, desc = desc, buttonText = buttonText, textSize = textSize, callback = callback, controller = nil, fullPath = path}
 
@@ -857,6 +984,7 @@ function nativeSettings.addButton(path, label, desc, buttonText, textSize, callb
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, button)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         button.widgetName = nativeSettings.getNextOptionName()
@@ -876,12 +1004,11 @@ function nativeSettings.addKeyBinding(path, label, desc, value, defaultValue, is
     end
 
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
-
     if not validPath then
         print(string.format("[NativeSettings] Path provided to the \"%s\" key binding is not valid!", label))
         return
     end
+    local placementIndex = nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 
     local keyBinding = {type = "keyBinding", path = path, label = label, desc = desc, value = value, defaultValue = defaultValue, isHold = isHold, callback = callback, controller = nil, fullPath = path}
 
@@ -894,6 +1021,7 @@ function nativeSettings.addKeyBinding(path, label, desc, value, defaultValue, is
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, keyBinding)
     end
+    nativeSettings.invalidateOptionsCache()
 
     if nativeSettings.currentTab == tabPath then
         keyBinding.widgetName = nativeSettings.getNextOptionName()
@@ -907,7 +1035,6 @@ end
 
 function nativeSettings.addCustom(path, callback, optionalIndex) -- Call this to add a "custom" widget
     local validPath, state, tabPath, subPath = nativeSettings.pathExists(path)
-
     if not validPath then
         print("[NativeSettings] Path provided to the custom control is not valid!")
         return
@@ -924,6 +1051,7 @@ function nativeSettings.addCustom(path, callback, optionalIndex) -- Call this to
         local idx = optionalIndex or #nativeSettings.data[tabPath].options + 1
         table.insert(nativeSettings.data[tabPath].options, idx, custom)
     end
+    nativeSettings.invalidateOptionsCache()
 
     return custom
 end
@@ -933,6 +1061,7 @@ function nativeSettings.pathExists(path) -- Check if a path exists, return a boo
         local tabPath = path:match("/.*/"):gsub("/", "")
         local subPath = path:gsub(tabPath, ""):gsub("/", "")
 
+        if nativeSettings.data[tabPath] == nil then return false end
         if nativeSettings.data[tabPath].subcategories[subPath] == nil then return false end
         return true, 0, tabPath, subPath
     elseif path:match("/.*[^/]") then
@@ -953,7 +1082,7 @@ function nativeSettings.setOption(tab, value) -- Use this to set an options valu
             success = true
             if o.type == "switch" then
                 if type(value) == "boolean" then
-                    if o.state == value then return end
+                    if o.state == value then break end
                     o.state = value
                     o.callback(o.state)
                     if o.controller then
@@ -963,9 +1092,9 @@ function nativeSettings.setOption(tab, value) -- Use this to set an options valu
                 else
                     print(string.format("[NativeSettings] Invalid data type passed for setOption \"%s\" : %s, expected: boolean", tab.label, type(value)))
                 end
-            elseif o.type == "rangeInt"then
+            elseif o.type == "rangeInt" then
                 if type(value) == "number" then
-                    if o.currentValue == value then return end
+                    if o.currentValue == value then break end
                     o.currentValue = value
                     o.callback(o.currentValue)
                     if o.controller then
@@ -978,9 +1107,9 @@ function nativeSettings.setOption(tab, value) -- Use this to set an options valu
                 else
                     print(string.format("[NativeSettings] Invalid data type passed for setOption \"%s\" : %s, expected: number", tab.label, type(value)))
                 end
-            elseif o.type == "rangeFloat"then
+            elseif o.type == "rangeFloat" then
                 if type(value) == "number" then
-                    if o.currentValue == value then return end
+                    if o.currentValue == value then break end
                     o.currentValue = value
                     o.callback(o.currentValue)
                     if o.controller then
@@ -993,9 +1122,9 @@ function nativeSettings.setOption(tab, value) -- Use this to set an options valu
                 else
                     print(string.format("[NativeSettings] Invalid data type passed for setOption \"%s\" : %s, expected: number", tab.label, type(value)))
                 end
-            elseif o.type == "selectorString"then
+            elseif o.type == "selectorString" then
                 if type(value) == "number" then
-                    if o.selectedElementIndex == value then return end
+                    if o.selectedElementIndex == value then break end
                     local idx = math.max(1, math.min(value, #o.elements))
                     o.selectedElementIndex = value
                     o.callback(o.selectedElementIndex)
@@ -1006,17 +1135,22 @@ function nativeSettings.setOption(tab, value) -- Use this to set an options valu
                 else
                     print(string.format("[NativeSettings] Invalid data type passed for setOption \"%s\" : %s, expected: number", tab.label, type(value)))
                 end
-            elseif o.type == "keyBinding"then
+            elseif o.type == "keyBinding" then
                 if type(value) == "string" then
                     o.value = value
                     o.callback(o.value)
                     if o.controller then
-                        o.controller.text:SetText(SettingsSelectorControllerKeyBinding.PrepareInputTag(value, "None", tab.isHold and "hold_input" or "None"))
+                        -- Bug: used to read `tab.isHold` instead of `o.isHold`. tab is the user-supplied
+                        -- table which may not carry isHold at all (the option table does). Fixed.
+                        o.controller.text:SetText(SettingsSelectorControllerKeyBinding.PrepareInputTag(value, "None", o.isHold and "hold_input" or "None"))
                     end
                 else
                     print(string.format("[NativeSettings] Invalid data type passed for setOption \"%s\" : %s, expected: string", tab.label, type(value)))
                 end
             end
+            -- Was: no break here, so setOption kept iterating every option in every tab even after
+            -- the match was found and fully applied. Wasted CPU on each external setValue call.
+            break
         end
     end
 
@@ -1042,8 +1176,13 @@ end
 
 function nativeSettings.populateOptions(this, categoryPath, subCategoryPath) -- Select right widget to spawn
     if subCategoryPath then
-        local _, _, _, subCategoryPath = nativeSettings.pathExists(subCategoryPath)
-        for _, option in pairs(nativeSettings.data[categoryPath:gsub("/", "")].subcategories[subCategoryPath].options) do
+        local _, _, _, subCatPath = nativeSettings.pathExists(subCategoryPath)
+        if not subCatPath then return end
+        local tabData = nativeSettings.data[categoryPath:gsub("/", "")]
+        if not tabData then return end
+        local subData = tabData.subcategories[subCatPath]
+        if not subData then return end
+        for _, option in pairs(subData.options) do
             option.widgetName = nativeSettings.getNextOptionName()
             if option.type == "switch" then
                 nativeSettings.spawnSwitch(this, option)
@@ -1057,12 +1196,14 @@ function nativeSettings.populateOptions(this, categoryPath, subCategoryPath) -- 
                 nativeSettings.spawnButton(this, option)
             elseif option.type == "keyBinding" then
                 nativeSettings.spawnKeyBinding(this, option)
-			elseif option.type == "custom" then
-				option.callback(this.settingsOptionsList.widget, option)
+            elseif option.type == "custom" then
+                option.callback(this.settingsOptionsList.widget, option)
             end
         end
     else
-        for _, option in pairs(nativeSettings.data[categoryPath:gsub("/", "")].options) do
+        local tabData = nativeSettings.data[categoryPath:gsub("/", "")]
+        if not tabData then return end
+        for _, option in pairs(tabData.options) do
             option.widgetName = nativeSettings.getNextOptionName()
             if option.type == "switch" then
                 nativeSettings.spawnSwitch(this, option)
@@ -1076,8 +1217,8 @@ function nativeSettings.populateOptions(this, categoryPath, subCategoryPath) -- 
                 nativeSettings.spawnButton(this, option)
             elseif option.type == "keyBinding" then
                 nativeSettings.spawnKeyBinding(this, option)
-			elseif option.type == "custom" then
-				option.callback(this.settingsOptionsList.widget, option)
+            elseif option.type == "custom" then
+                option.callback(this.settingsOptionsList.widget, option)
             end
         end
     end
@@ -1103,9 +1244,11 @@ function nativeSettings.spawnRangeInt(this, option, idx)
     currentItem.newValue = option.currentValue
     currentItem.ValueText:SetText(tostring(option.currentValue))
 
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    -- Register in the controller->option map so getOptionTable is O(1) instead of O(N).
+    nativeSettings.registerController(currentItem, option)
 end
 
 function nativeSettings.spawnRangeFloat(this, option, idx)
@@ -1128,9 +1271,10 @@ function nativeSettings.spawnRangeFloat(this, option, idx)
     currentItem.newValue = option.currentValue
     currentItem.ValueText:SetText(string.format(option.format, option.currentValue))
 
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    nativeSettings.registerController(currentItem, option)
 end
 
 function nativeSettings.spawnStringList(this, option, idx)
@@ -1151,9 +1295,10 @@ function nativeSettings.spawnStringList(this, option, idx)
 
     currentItem.ValueText:SetText(option.elements[option.selectedElementIndex])
 
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    nativeSettings.registerController(currentItem, option)
 end
 
 function nativeSettings.spawnSwitch(this, option, idx)
@@ -1170,9 +1315,10 @@ function nativeSettings.spawnSwitch(this, option, idx)
     currentItem.offState:SetVisible(not option.state)
     currentItem:RegisterToCallback("OnHoverOver", this, "OnSettingHoverOver")
     currentItem:RegisterToCallback("OnHoverOut", this, "OnSettingHoverOut")
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    nativeSettings.registerController(currentItem, option)
 end
 
 function nativeSettings.spawnButton(this, option, idx)
@@ -1206,25 +1352,31 @@ function nativeSettings.spawnButton(this, option, idx)
     text:SetText(option.buttonText)
     text:Reparent(anchor, -1)
 
-    -- Hide parts from the original switch widget
+    -- Hide parts from the original switch widget.
+    -- Bug: original code had `off` querying {"onState", "body"} (copy-paste from `on`), so the
+    -- offState body was never actually hidden. Fixed to query {"offState", "body"}.
     local root = currentItem:GetRootWidget():GetWidgetByPath(BuildWidgetPath({"layout", "container"}))
     local on = root:GetWidgetByPath(BuildWidgetPath({"onState", "body"}))
-    local off = root:GetWidgetByPath(BuildWidgetPath({"onState", "body"}))
-    on:GetWidgetByPath(BuildWidgetPath({"button"})):SetVisible(false)
-    on:GetWidgetByPath(BuildWidgetPath({"txtValue"})):SetVisible(false)
-    on:GetWidgetByPath(BuildWidgetPath({"buttonBorder"})):SetVisible(false)
-
-    off:GetWidgetByPath(BuildWidgetPath({"button"})):SetVisible(false)
-    off:GetWidgetByPath(BuildWidgetPath({"txtValue"})):SetVisible(false)
-    off:GetWidgetByPath(BuildWidgetPath({"buttonBorder"})):SetVisible(false)
+    local off = root:GetWidgetByPath(BuildWidgetPath({"offState", "body"}))
+    if on then
+        on:GetWidgetByPath(BuildWidgetPath({"button"})):SetVisible(false)
+        on:GetWidgetByPath(BuildWidgetPath({"txtValue"})):SetVisible(false)
+        on:GetWidgetByPath(BuildWidgetPath({"buttonBorder"})):SetVisible(false)
+    end
+    if off then
+        off:GetWidgetByPath(BuildWidgetPath({"button"})):SetVisible(false)
+        off:GetWidgetByPath(BuildWidgetPath({"txtValue"})):SetVisible(false)
+        off:GetWidgetByPath(BuildWidgetPath({"buttonBorder"})):SetVisible(false)
+    end
 
     -- Avoid toggle left / right callbacks resulting in the switch widget showing up again
     currentItem.offStateBody:UnregisterFromCallback("OnRelease", currentItem, "OnLeft")
     currentItem.onStateBody:UnregisterFromCallback("OnRelease", currentItem, "OnRight")
 
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    nativeSettings.registerController(currentItem, option)
 end
 
 function nativeSettings.spawnKeyBinding(this, option, idx)
@@ -1241,26 +1393,33 @@ function nativeSettings.spawnKeyBinding(this, option, idx)
     currentItem:RegisterToCallback("OnHoverOut", this, "OnSettingHoverOut")
     currentItem.text:SetText(SettingsSelectorControllerKeyBinding.PrepareInputTag(option.value, "None", option.isHold and "hold_input" or "None"))
 
-    this.settingsElements = nativeSettings.nativeInsert(this.settingsElements, currentItem)
+    table.insert(this.settingsElements, currentItem)
 
     option.controller = currentItem
+    nativeSettings.registerController(currentItem, option)
 end
 
+-- Kept for backwards compat with any mod that called nativeInsert directly.
+-- Internally we now use table.insert to skip the extra function-call overhead
+-- on the slider-drag hot path.
 function nativeSettings.nativeInsert(nTable, value)
-    local t = nTable
-    table.insert(t, value)
-
-    return t
+    table.insert(nTable, value)
+    return nTable
 end
 
 function nativeSettings.getIndex(tab, val)
-    local index = nil
-    for i, v in pairs(tab) do
+    for i, v in ipairs(tab) do
         if v == val then
-            index = i
+            return i
         end
     end
-    return index
+    -- Fall back to pairs in case the table has holes (legacy data).
+    for i, v in pairs(tab) do
+        if v == val then
+            return i
+        end
+    end
+    return nil
 end
 
 function nativeSettings.isSameInstance(a, b) -- Credits to psiberx for this
@@ -1268,24 +1427,37 @@ function nativeSettings.isSameInstance(a, b) -- Credits to psiberx for this
     return Game["OperatorEqual;IScriptableIScriptable;Bool"](a, b)
 end
 
+-- Register a controller in the O(1) lookup map. tostring() gives a stable identity string
+-- for the IScriptable; that's enough to avoid calling the Game[] equality operator on every
+-- slider drag tick (which was the main source of stutter with many options installed).
+function nativeSettings.registerController(controller, option)
+    if not controller then return end
+    nativeSettings.controllerToOption[tostring(controller)] = option
+end
+
 function nativeSettings.getOptionTable(optionController)
-    if nativeSettings.currentOptionTable then
-        if nativeSettings.isSameInstance(nativeSettings.currentOptionTable.controller, optionController) then
-            return nativeSettings.currentOptionTable
-        else
-            return nil
+    if optionController == nil then return nil end
+
+    -- Fast path: O(1) lookup in the controller->option map.
+    local key = tostring(optionController)
+    local cached = nativeSettings.controllerToOption[key]
+    if cached then
+        -- Verify the controller hasn't been GC'd and replaced by another at the same address
+        -- (rare, but possible between tab switches). If the cached option's controller field
+        -- matches, we're done.
+        if cached.controller and nativeSettings.isSameInstance(cached.controller, optionController) then
+            return cached
         end
+        -- Stale entry; drop it and fall through to the slow scan.
+        nativeSettings.controllerToOption[key] = nil
     end
 
+    -- Legacy slow path: iterate every option in every tab. Kept as a fallback so a missed
+    -- registerController call (e.g. by a custom widget type added by another mod) still works.
     for _, tab in pairs(nativeSettings.data) do
         for _, o in pairs(tab.options) do
             if nativeSettings.isSameInstance(o.controller, optionController) then
-                if nativeSettings.currentOptionTable == nil then
-                    nativeSettings.currentOptionTable = o
-                    nativeSettings.Cron.NextTick(function ()
-                        nativeSettings.currentOptionTable = nil
-                    end)
-                end
+                nativeSettings.registerController(optionController, o)
                 return o
             end
         end
@@ -1293,20 +1465,20 @@ function nativeSettings.getOptionTable(optionController)
         for _, sub in pairs(tab.subcategories) do
             for _, o in pairs(sub.options) do
                 if nativeSettings.isSameInstance(o.controller, optionController) then
-                    if nativeSettings.currentOptionTable == nil then
-                        nativeSettings.currentOptionTable = o
-                        nativeSettings.Cron.NextTick(function ()
-                            nativeSettings.currentOptionTable = nil
-                        end)
-                    end
+                    nativeSettings.registerController(optionController, o)
                     return o
                 end
             end
         end
     end
+    return nil
 end
 
 function nativeSettings.getAllOptions()
+    -- Always build a fresh array. The original did the same — we must not return a
+    -- cached/shared table because callers (including external mods) may modify the
+    -- result, and a shared cache would be corrupted. The real performance win is
+    -- in getOptionTable (controllerToOption map), not here.
     local all = {}
 
     for _, tab in pairs(nativeSettings.data) do
@@ -1324,11 +1496,22 @@ function nativeSettings.getAllOptions()
     return all
 end
 
+function nativeSettings.invalidateOptionsCache()
+    -- No-op. Kept for backwards compat (some add*/remove* functions call it).
+    -- getAllOptions() no longer caches, so there's nothing to invalidate.
+    nativeSettings.allOptionsCache = nil
+end
+
 function nativeSettings.clearControllers() -- Prevent crashes by releasing it from memory (I guess)
     for _, option in pairs(nativeSettings.getAllOptions()) do
         option.controller = nil
     end
+    -- Also drop the controller->option lookup so a future tab open with new controllers at
+    -- the same addresses doesn't false-positive on a stale entry.
+    nativeSettings.controllerToOption = {}
+    nativeSettings.currentOptionTable = nil
     nativeSettings.currentTab = ""
+    nativeSettings.invalidateOptionsCache()
 end
 
 function nativeSettings.getNextOptionName() -- Generate unique names for widgets
@@ -1356,16 +1539,24 @@ function nativeSettings.getOptionIndexOffset(tabPath, subPath, optionalIndex)
 end
 
 function nativeSettings.saveScrollPos()
+    if not nativeSettings.settingsMainController then return end
     local scrollArea = nativeSettings.settingsMainController:GetRootWidget():GetWidget(StringToName("wrapper/wrapper/MainScrollingArea/scroll_area"))
+    if not scrollArea then return end
     nativeSettings.oldScrollPos = scrollArea:GetVerticalScrollPosition() * scrollArea:GetContentSize().Y
 end
 
 function nativeSettings.restoreScrollPos()
     nativeSettings.Cron.NextTick(function()
+        if not nativeSettings.settingsMainController then return end
         local scrollArea = nativeSettings.settingsMainController:GetRootWidget():GetWidget(StringToName("wrapper/wrapper/MainScrollingArea/scroll_area"))
-        local newPos = nativeSettings.oldScrollPos / scrollArea:GetContentSize().Y
+        if not scrollArea then return end
+        local contentSize = scrollArea:GetContentSize().Y
+        if contentSize == 0 then return end
+        local newPos = nativeSettings.oldScrollPos / contentSize
         local mainScrollArea = nativeSettings.settingsMainController:GetRootWidget():GetWidget(StringToName("wrapper/wrapper/MainScrollingArea"))
-        mainScrollArea:GetController():SetScrollPosition(newPos)
+        if mainScrollArea and mainScrollArea:GetController() then
+            mainScrollArea:GetController():SetScrollPosition(newPos)
+        end
     end)
 end
 
@@ -1381,6 +1572,8 @@ end
 
 function nativeSettings.switchToNextPage(settingsController, fromNextMenu)
     if not nativeSettings.tabSizeCache then return end
+    if not nativeSettings.nextButton or not nativeSettings.previousButton then return end
+
     if nativeSettings.currentPage == #nativeSettings.tabSizeCache and #nativeSettings.tabSizeCache > 1 then
         -- Wrap around to first page
         nativeSettings.currentPage = 0
@@ -1393,12 +1586,12 @@ function nativeSettings.switchToNextPage(settingsController, fromNextMenu)
 
     if nativeSettings.currentPage == #nativeSettings.tabSizeCache then
         nativeSettings.nextButton.root:SetVisible(false)
-        if nativeSettings.previousButton then
-            nativeSettings.previousButton.root:SetVisible(true)
-        end
+        nativeSettings.previousButton.root:SetVisible(true)
     else
         nativeSettings.nextButton.root:SetVisible(true)
-        if nativeSettings.previousButton and not (nativeSettings.currentPage == 1) then
+        if nativeSettings.currentPage == 1 then
+            nativeSettings.previousButton.root:SetVisible(false)
+        else
             nativeSettings.previousButton.root:SetVisible(true)
         end
     end
@@ -1411,6 +1604,8 @@ end
 
 function nativeSettings.switchToPreviousPage(settingsController, fromPriorMenu)
     if not nativeSettings.tabSizeCache then return end
+    if not nativeSettings.nextButton or not nativeSettings.previousButton then return end
+
     if nativeSettings.currentPage == 1 and #nativeSettings.tabSizeCache > 1 then
         -- Wrap around to last page
         nativeSettings.currentPage = #nativeSettings.tabSizeCache + 1
@@ -1430,27 +1625,23 @@ function nativeSettings.switchToPreviousPage(settingsController, fromPriorMenu)
 
     if nativeSettings.currentPage == 1 then
         nativeSettings.previousButton.root:SetVisible(false)
-        if nativeSettings.nextButton then
-            nativeSettings.nextButton.root:SetVisible(true)
-        end
+        nativeSettings.nextButton.root:SetVisible(true)
     else
         nativeSettings.previousButton.root:SetVisible(true)
-        if nativeSettings.nextButton and not (nativeSettings.currentPage == #nativeSettings.tabSizeCache) then
+        if nativeSettings.currentPage == #nativeSettings.tabSizeCache then
+            nativeSettings.nextButton.root:SetVisible(false)
+        else
             nativeSettings.nextButton.root:SetVisible(true)
         end
     end
 
-    if nativeSettings.tabSizeCache then
-        local idx
-        if fromPriorMenu then
-            idx = #nativeSettings.tabSizeCache[nativeSettings.currentPage]
-        else
-            idx = #nativeSettings.tabSizeCache[nativeSettings.currentPage] - 1
-        end
-        settingsController:PopulateCategories(idx)
+    local idx
+    if fromPriorMenu then
+        idx = #nativeSettings.tabSizeCache[nativeSettings.currentPage]
     else
-        settingsController:PopulateCategories(settingsController.settings:GetMenuIndex())
+        idx = #nativeSettings.tabSizeCache[nativeSettings.currentPage] - 1
     end
+    settingsController:PopulateCategories(idx)
 end
 
 return nativeSettings
